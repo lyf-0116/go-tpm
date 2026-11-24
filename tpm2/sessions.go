@@ -200,6 +200,7 @@ type sessionOptions struct {
 	attrs       TPMASession
 	symmetric   TPMTSymDef
 	trialPolicy bool
+	maxUses     int
 }
 
 // defaultOptions represents the default options used when none are provided.
@@ -321,6 +322,17 @@ func Trial() AuthOption {
 	}
 }
 
+// MaxUses imposes a local transactional use count on the session. A rejected
+// command restores the count, while a successfully completed command consumes
+// one use. When the count reaches zero, the session is marked invalid.
+//
+// A value less than or equal to zero leaves the session's use count unlimited.
+func MaxUses(limit int) AuthOption {
+	return func(o *sessionOptions) {
+		o.maxUses = limit
+	}
+}
+
 // hmacSession generally implements the HMAC session.
 type hmacSession struct {
 	sessionOptions
@@ -328,6 +340,8 @@ type hmacSession struct {
 	nonceSize  int
 	handle     TPMHandle
 	sessionKey []byte
+	invalid    error
+	uses       useBudget
 	// last nonceCaller
 	nonceCaller TPM2BNonce
 	// last nonceTPM
@@ -347,6 +361,7 @@ func HMAC(hash TPMIAlgHash, nonceSize int, opts ...AuthOption) Session {
 	for _, opt := range opts {
 		opt(&sess.sessionOptions)
 	}
+	sess.uses = newUseBudget(sess.maxUses)
 	return &sess
 }
 
@@ -362,6 +377,7 @@ func HMACSession(t transport.TPM, hash TPMIAlgHash, nonceSize int, opts ...AuthO
 	for _, opt := range opts {
 		opt(&sess.sessionOptions)
 	}
+	sess.uses = newUseBudget(sess.maxUses)
 	// This session is reusable and is closed with the function we'll
 	// return.
 	sess.attrs.ContinueSession = true
@@ -397,6 +413,9 @@ func getEncryptedSalt(pub TPMTPublic) (*TPM2BEncryptedSecret, []byte, error) {
 
 // Init initializes the session, just in time, if needed.
 func (s *hmacSession) Init(t transport.TPM) error {
+	if s.invalid != nil {
+		return s.invalid
+	}
 	if s.handle != TPMRHNull {
 		// Session is already initialized.
 		return nil
@@ -452,6 +471,9 @@ func (s *hmacSession) Init(t transport.TPM) error {
 
 // Cleanup cleans up the session, if needed.
 func (s *hmacSession) CleanupFailure(t transport.TPM) error {
+	if s.handle == TPMRHNull {
+		return nil
+	}
 	// The user is already responsible to clean up this session.
 	if s.attrs.ContinueSession {
 		return nil
@@ -536,6 +558,9 @@ func (s *hmacSession) NewNonceCaller() error {
 // Authorize computes the authorization structure for the session.
 // Unlike the TPM spec, authIndex is zero-based.
 func (s *hmacSession) Authorize(cc TPMCC, parms, addNonces []byte, names []TPM2BName, authIndex int) (*TPMSAuthCommand, error) {
+	if s.invalid != nil {
+		return nil, s.invalid
+	}
 	if s.handle == TPMRHNull {
 		// Session is not initialized.
 		return nil, fmt.Errorf("session not initialized")
@@ -687,7 +712,16 @@ func (s *hmacSession) Decrypt(parameter []byte) error {
 // If the session is created with HMAC (instead of HMACSession) this will be
 // TPM_RH_NULL.
 func (s *hmacSession) Handle() TPMHandle {
+	if s.invalid != nil {
+		return TPMRHNull
+	}
 	return s.handle
+}
+
+// InvalidateSession marks the session as unsynchronized after an indeterminate
+// transport failure.
+func (s *hmacSession) InvalidateSession(cause error) {
+	s.invalid = sessionInvalidError(cause)
 }
 
 // PolicyCallback represents an object's policy in the form of a function.
@@ -701,6 +735,8 @@ type policySession struct {
 	nonceSize  int
 	handle     TPMHandle
 	sessionKey []byte
+	invalid    error
+	uses       useBudget
 	// last nonceCaller
 	nonceCaller TPM2BNonce
 	// last nonceTPM
@@ -725,6 +761,7 @@ func Policy(hash TPMIAlgHash, nonceSize int, callback PolicyCallback, opts ...Au
 	for _, opt := range opts {
 		opt(&sess.sessionOptions)
 	}
+	sess.uses = newUseBudget(sess.maxUses)
 	return &sess
 }
 
@@ -743,6 +780,7 @@ func PolicySession(t transport.TPM, hash TPMIAlgHash, nonceSize int, opts ...Aut
 	for _, opt := range opts {
 		opt(&sess.sessionOptions)
 	}
+	sess.uses = newUseBudget(sess.maxUses)
 
 	// This session is reusable and is closed with the function we'll
 	// return.
@@ -763,6 +801,9 @@ func PolicySession(t transport.TPM, hash TPMIAlgHash, nonceSize int, opts ...Aut
 
 // Init initializes the session, just in time, if needed.
 func (s *policySession) Init(t transport.TPM) error {
+	if s.invalid != nil {
+		return s.invalid
+	}
 	if s.handle != TPMRHNull {
 		// Session is already initialized.
 		return nil
@@ -831,6 +872,9 @@ func (s *policySession) Init(t transport.TPM) error {
 
 // CleanupFailure cleans up the session, if needed.
 func (s *policySession) CleanupFailure(t transport.TPM) error {
+	if s.handle == TPMRHNull {
+		return nil
+	}
 	// The user is already responsible to clean up this session.
 	if s.attrs.ContinueSession {
 		return nil
@@ -855,6 +899,9 @@ func (s *policySession) NewNonceCaller() error {
 
 // Authorize computes the authorization structure for the session.
 func (s *policySession) Authorize(cc TPMCC, parms, addNonces []byte, names []TPM2BName, _ int) (*TPMSAuthCommand, error) {
+	if s.invalid != nil {
+		return nil, s.invalid
+	}
 	if s.handle == TPMRHNull {
 		// Session is not initialized.
 		return nil, fmt.Errorf("session not initialized")
@@ -1020,5 +1067,14 @@ func (s *policySession) Decrypt(parameter []byte) error {
 // If the session is created with Policy (instead of PolicySession) this will be
 // TPM_RH_NULL.
 func (s *policySession) Handle() TPMHandle {
+	if s.invalid != nil {
+		return TPMRHNull
+	}
 	return s.handle
+}
+
+// InvalidateSession marks the session as unsynchronized after an indeterminate
+// transport failure.
+func (s *policySession) InvalidateSession(cause error) {
+	s.invalid = sessionInvalidError(cause)
 }

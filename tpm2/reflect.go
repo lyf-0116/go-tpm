@@ -22,7 +22,7 @@ const (
 )
 
 // execute sends the provided command and returns the TPM's response.
-func execute[R any](t transport.TPM, cmd Command[R, *R], rsp *R, extraSess ...Session) error {
+func execute[R any](t transport.TPM, cmd Command[R, *R], rsp *R, extraSess ...Session) (err error) {
 	cc := cmd.Command()
 	sess, err := cmdAuths(cmd)
 	if err != nil {
@@ -33,10 +33,46 @@ func execute[R any](t transport.TPM, cmd Command[R, *R], rsp *R, extraSess ...Se
 		return fmt.Errorf("too many sessions: %v", len(sess))
 	}
 	hasSessions := len(sess) > 0
+	transactions := make([]SessionTransaction, len(sess))
+	transportFailed := false
+	defer func() {
+		if err == nil {
+			return
+		}
+
+		for i := len(transactions) - 1; i >= 0; i-- {
+			if transactions[i] != nil {
+				transactions[i].Rollback()
+			}
+		}
+
+		if transportFailed {
+			for _, s := range sess {
+				invalidateSession(s, err)
+			}
+			return
+		}
+
+		var cleanupErrs []string
+		// Emergency cleanup, then return.
+		for _, s := range sess {
+			if cleanupErr := s.CleanupFailure(t); cleanupErr != nil {
+				cleanupErrs = append(cleanupErrs, cleanupErr.Error())
+			}
+		}
+		if len(cleanupErrs) != 0 {
+			err = fmt.Errorf("%w - additional errors encountered during cleanup: %v", err, strings.Join(cleanupErrs, ", "))
+		}
+	}()
+
 	// Initialize the sessions, if needed
 	for i, s := range sess {
 		if err := s.Init(t); err != nil {
 			return fmt.Errorf("initializing session %d: %w", i, err)
+		}
+		transactions[i], err = beginSessionTransaction(s)
+		if err != nil {
+			return err
 		}
 		if err := s.NewNonceCaller(); err != nil {
 			return err
@@ -69,8 +105,10 @@ func execute[R any](t transport.TPM, cmd Command[R, *R], rsp *R, extraSess ...Se
 	command = append(command, parms...)
 
 	// Send the command via the transport.
-	response, err := t.Send(command)
-	if err != nil {
+	response, sendErr := t.Send(command)
+	if sendErr != nil {
+		err = sendErr
+		transportFailed = true
 		return err
 	}
 
@@ -78,16 +116,6 @@ func execute[R any](t transport.TPM, cmd Command[R, *R], rsp *R, extraSess ...Se
 	rspBuf := bytes.NewBuffer(response)
 	err = rspHeader(rspBuf)
 	if err != nil {
-		var bonusErrs []string
-		// Emergency cleanup, then return.
-		for _, s := range sess {
-			if err := s.CleanupFailure(t); err != nil {
-				bonusErrs = append(bonusErrs, err.Error())
-			}
-		}
-		if len(bonusErrs) != 0 {
-			return fmt.Errorf("%w - additional errors encountered during cleanup: %v", err, strings.Join(bonusErrs, ", "))
-		}
 		return err
 	}
 	err = rspHandles(rspBuf, rsp)
@@ -115,6 +143,11 @@ func execute[R any](t transport.TPM, cmd Command[R, *R], rsp *R, extraSess ...Se
 	err = rspParameters(rspParms, sess, rsp)
 	if err != nil {
 		return err
+	}
+	for _, tx := range transactions {
+		if tx != nil {
+			tx.Commit()
+		}
 	}
 
 	return nil
