@@ -845,13 +845,19 @@ func cmdHandles[R any](cmd Command[R, *R]) ([]byte, error) {
 
 // cmdNames returns the names of the entities referenced by the handles of the command.
 func cmdNames[R any](cmd Command[R, *R]) ([]TPM2BName, error) {
-	handles := taggedMembers(reflect.ValueOf(cmd), "handle", false)
+	cmdValue := reflect.ValueOf(cmd)
+	cmdType := reflect.TypeOf(cmd)
 	var result []TPM2BName
-	for i, maybeHandle := range handles {
-		h, err := asHandle(maybeHandle)
+	for i := 0; i < cmdType.NumField(); i++ {
+		field := cmdType.Field(i)
+		if !hasTag(field, "handle") {
+			continue
+		}
+
+		h, err := asHandle(cmdValue.Field(i))
 		if err != nil {
 			return nil, fmt.Errorf("invalid 'handle'-tagged member of %q: %v",
-				reflect.TypeOf(cmd), err)
+				cmdType, err)
 		}
 
 		// Special case: handles with an empty name buffer (anonymous:anon)
@@ -859,14 +865,14 @@ func cmdNames[R any](cmd Command[R, *R]) ([]TPM2BName, error) {
 		// The Name of a sequence object is an Empty Buffer (sized array with no
 		// data; indicated by a size field of zero followed by an array
 		// containing no elements)
-		if hasTag(reflect.ValueOf(cmd).Type().Field(i), "anon") {
+		if hasTag(field, "anon") {
 			continue
 		}
 
 		name := h.KnownName()
 		if name == nil {
 			return nil, fmt.Errorf("missing Name for '%v' parameter",
-				reflect.ValueOf(cmd).Type().Field(i).Name)
+				field.Name)
 		}
 		result = append(result, *name)
 	}
@@ -910,8 +916,6 @@ func unmarshalParameter[C Command[R, *R], R any](buf *bytes.Buffer, cmd *C, i in
 
 // populateHandlesFromNames populates the handle fields of a command with handles
 // created from the provided names.
-//
-// All handle fields are populated with [UnmarshalledHandle]
 func populateHandlesFromNames[C Command[R, *R], R any](cmd *C, names []TPM2BName) error {
 	cmdValue := reflect.ValueOf(cmd).Elem()
 	cmdType := reflect.TypeOf(*cmd)
@@ -937,7 +941,29 @@ func populateHandlesFromNames[C Command[R, *R], R any](cmd *C, names []TPM2BName
 			Name: names[nameIdx],
 		}
 
-		cmdValue.Field(i).Set(reflect.ValueOf(handleValue))
+		fieldValue := cmdValue.Field(i)
+		switch {
+		case reflect.TypeOf(handleValue).AssignableTo(fieldValue.Type()):
+			fieldValue.Set(reflect.ValueOf(handleValue))
+		case fieldValue.Type() == reflect.TypeOf(AuthHandle{}):
+			fieldValue.Set(reflect.ValueOf(AuthHandle{Name: names[nameIdx]}))
+		case fieldValue.Type() == reflect.TypeOf(NamedHandle{}):
+			fieldValue.Set(reflect.ValueOf(NamedHandle{Name: names[nameIdx]}))
+		case fieldValue.Kind() >= reflect.Uint && fieldValue.Kind() <= reflect.Uint64:
+			// Concrete handle types cannot carry a Name, so retain the handle
+			// value when the Name is handle-sized and use the invalid sentinel
+			// for object Names.
+			value := uint64(invalidHandleValue)
+			if len(names[nameIdx].Buffer) == 4 {
+				value = uint64(binary.BigEndian.Uint32(names[nameIdx].Buffer))
+			}
+			if fieldValue.OverflowUint(value) {
+				return fmt.Errorf("handle value %d does not fit in field %d of type %s", value, i, fieldValue.Type())
+			}
+			fieldValue.SetUint(value)
+		default:
+			return fmt.Errorf("cannot populate handle field %d of type %s from a Name", i, fieldValue.Type())
+		}
 		nameIdx++
 	}
 
