@@ -157,34 +157,71 @@ func (s *pwSession) Decrypt(_ []byte) error { return nil }
 // In the case of a password session, this is always TPM_RS_PW.
 func (s *pwSession) Handle() TPMHandle { return TPMRSPW }
 
-// cpHash calculates the TPM command parameter hash.
-// cpHash = hash(CC || names || parms)
-func cpHash(alg TPMIAlgHash, cc TPMCC, names []TPM2BName, parms []byte) ([]byte, error) {
+// marshalHashPreimage builds the byte sequence hashed for either a cpHash or
+// an rpHash. Keeping both layouts here ensures the command code, names,
+// response code, and parameters are always ordered consistently.
+//
+//	cpHash preimage = CC || Name1 || Name2 || Name3 || parms
+//	rpHash preimage = RC || CC || parms
+func marshalHashPreimage(cc TPMCC, rc TPMRC, names []TPM2BName, parms []byte, response bool) ([]byte, error) {
+	var buf bytes.Buffer
+	if response {
+		if err := binary.Write(&buf, binary.BigEndian, rc); err != nil {
+			return nil, fmt.Errorf("marshalling response code: %w", err)
+		}
+	}
+	if err := binary.Write(&buf, binary.BigEndian, cc); err != nil {
+		return nil, fmt.Errorf("marshalling command code: %w", err)
+	}
+	if !response {
+		for i, name := range names {
+			if _, err := buf.Write(name.Buffer); err != nil {
+				return nil, fmt.Errorf("marshalling name %d: %w", i, err)
+			}
+		}
+	}
+	if _, err := buf.Write(parms); err != nil {
+		return nil, fmt.Errorf("marshalling parameters: %w", err)
+	}
+	return buf.Bytes(), nil
+}
+
+func marshalCommandHashPreimage(cc TPMCC, names []TPM2BName, parms []byte) ([]byte, error) {
+	return marshalHashPreimage(cc, 0, names, parms, false)
+}
+
+func marshalResponseHashPreimage(cc TPMCC, parms []byte) ([]byte, error) {
+	return marshalHashPreimage(cc, TPMRCSuccess, nil, parms, true)
+}
+
+func hashPreimage(alg TPMIAlgHash, preimage []byte) ([]byte, error) {
 	ha, err := alg.Hash()
 	if err != nil {
 		return nil, err
 	}
 	h := ha.New()
-	binary.Write(h, binary.BigEndian, cc)
-	for _, name := range names {
-		h.Write(name.Buffer)
-	}
-	h.Write(parms)
+	h.Write(preimage)
 	return h.Sum(nil), nil
+}
+
+// cpHash calculates the TPM command parameter hash.
+// cpHash = hash(CC || names || parms)
+func cpHash(alg TPMIAlgHash, cc TPMCC, names []TPM2BName, parms []byte) ([]byte, error) {
+	preimage, err := marshalCommandHashPreimage(cc, names, parms)
+	if err != nil {
+		return nil, err
+	}
+	return hashPreimage(alg, preimage)
 }
 
 // rpHash calculates the TPM response parameter hash.
 // rpHash = hash(RC || CC || parms)
 func rpHash(alg TPMIAlgHash, rc TPMRC, cc TPMCC, parms []byte) ([]byte, error) {
-	ha, err := alg.Hash()
+	preimage, err := marshalHashPreimage(cc, rc, nil, parms, true)
 	if err != nil {
 		return nil, err
 	}
-	h := ha.New()
-	binary.Write(h, binary.BigEndian, rc)
-	binary.Write(h, binary.BigEndian, cc)
-	h.Write(parms)
-	return h.Sum(nil), nil
+	return hashPreimage(alg, preimage)
 }
 
 // sessionOptions represents extra options used when setting up an HMAC or policy session.

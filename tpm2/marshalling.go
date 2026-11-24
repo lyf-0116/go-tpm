@@ -139,8 +139,10 @@ func (b *boxed[T]) unmarshal(buf *bytes.Buffer) error {
 // Note: Encrypted command parameters (via sessions) are not currently supported.
 // The marshaled parameters are in their unencrypted form.
 func MarshalCommand[C Command[R, *R], R any](cmd C) ([]byte, error) {
-	cc := cmd.Command()
+	return marshalCommandPreimage(cmd.Command(), cmd)
+}
 
+func marshalCommandPreimage[C Command[R, *R], R any](cc TPMCC, cmd C) ([]byte, error) {
 	names, err := cmdNames(cmd)
 	if err != nil {
 		return nil, err
@@ -153,23 +155,7 @@ func MarshalCommand[C Command[R, *R], R any](cmd C) ([]byte, error) {
 
 	// Build raw cpHash preimage: CommandCode {∥ Name1 {∥ Name2 {∥ Name3 }}} {∥ Parameters }
 	// See section 16.7 of TPM 2.0 specification, part 1.
-	buf := new(bytes.Buffer)
-
-	if err := binary.Write(buf, binary.BigEndian, cc); err != nil {
-		return nil, fmt.Errorf("marshalling command code: %w", err)
-	}
-
-	for i, name := range names {
-		if _, err := buf.Write(name.Buffer); err != nil {
-			return nil, fmt.Errorf("marshalling name %d: %w", i, err)
-		}
-	}
-
-	if _, err := buf.Write(params); err != nil {
-		return nil, fmt.Errorf("marshalling parameters: %w", err)
-	}
-
-	return buf.Bytes(), nil
+	return marshalCommandHashPreimage(cc, names, params)
 }
 
 // UnmarshalCommand unmarshals a raw cpHash preimage back into a TPM command.
@@ -304,30 +290,17 @@ func parseNameSize(buf []byte) (int, error) {
 //
 // Note: Encrypted response parameters (via sessions) are not currently supported.
 func MarshalResponse[C Command[R, *R], R any](cmd C, rsp *R) ([]byte, error) {
-	cc := cmd.Command()
+	return marshalResponsePreimage(cmd.Command(), rsp)
+}
 
+func marshalResponsePreimage[R any](cc TPMCC, rsp *R) ([]byte, error) {
 	params, err := marshalRspParameters(rsp, nil)
 	if err != nil {
 		return nil, err
 	}
 
 	// Build raw rpHash preimage: responseCode || commandCode || parameters
-	buf := new(bytes.Buffer)
-
-	// Write responseCode (4 bytes, always 0 for successful responses)
-	if err := binary.Write(buf, binary.BigEndian, uint32(0)); err != nil {
-		return nil, fmt.Errorf("marshalling response code: %w", err)
-	}
-
-	if err := binary.Write(buf, binary.BigEndian, cc); err != nil {
-		return nil, fmt.Errorf("marshalling command code: %w", err)
-	}
-
-	if _, err := buf.Write(params); err != nil {
-		return nil, fmt.Errorf("marshalling parameters: %w", err)
-	}
-
-	return buf.Bytes(), nil
+	return marshalResponseHashPreimage(cc, params)
 }
 
 // UnmarshalResponse unmarshals a raw rpHash preimage back into a TPM response.
