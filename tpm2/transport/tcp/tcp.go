@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+
+	"github.com/google/go-tpm/tpm2/internal/handles"
 )
 
 var (
@@ -183,7 +185,9 @@ func (t *TPM) Send(cmd []byte) ([]byte, error) {
 
 // Close implements the TPMCloser interface.
 func (t *TPM) Close() error {
-	return errors.Join(t.cmd.Close(), t.plat.Close())
+	err := errors.Join(t.cmd.Close(), t.plat.Close())
+	handles.InvalidateAll(t)
+	return err
 }
 
 // PowerOn powers on the TPM.

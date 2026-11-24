@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/binary"
 
+	"github.com/google/go-tpm/tpm2/internal/handles"
 	"github.com/google/go-tpm/tpm2/transport"
 )
 
@@ -1762,9 +1763,11 @@ func (FlushContext) Command() TPMCC { return TPMCCFlushContext }
 // Execute executes the command and returns the response.
 func (cmd FlushContext) Execute(t transport.TPM, s ...Session) (*FlushContextResponse, error) {
 	var rsp FlushContextResponse
-	err := execute[FlushContextResponse](t, cmd, &rsp, s...)
-	if err != nil {
+	if err := execute[FlushContextResponse](t, cmd, &rsp, s...); err != nil {
 		return nil, err
+	}
+	if cmd.FlushHandle != nil {
+		handles.Invalidate(cmd.FlushHandle.HandleValue(), t)
 	}
 	return &rsp, nil
 }

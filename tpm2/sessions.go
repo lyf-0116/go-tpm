@@ -326,7 +326,7 @@ type hmacSession struct {
 	sessionOptions
 	hash       TPMIAlgHash
 	nonceSize  int
-	handle     TPMHandle
+	handle     sessionHandle
 	sessionKey []byte
 	// last nonceCaller
 	nonceCaller TPM2BNonce
@@ -342,7 +342,6 @@ func HMAC(hash TPMIAlgHash, nonceSize int, opts ...AuthOption) Session {
 		sessionOptions: defaultOptions(),
 		hash:           hash,
 		nonceSize:      nonceSize,
-		handle:         TPMRHNull,
 	}
 	for _, opt := range opts {
 		opt(&sess.sessionOptions)
@@ -357,7 +356,6 @@ func HMACSession(t transport.TPM, hash TPMIAlgHash, nonceSize int, opts ...AuthO
 		sessionOptions: defaultOptions(),
 		hash:           hash,
 		nonceSize:      nonceSize,
-		handle:         TPMRHNull,
 	}
 	for _, opt := range opts {
 		opt(&sess.sessionOptions)
@@ -372,8 +370,7 @@ func HMACSession(t transport.TPM, hash TPMIAlgHash, nonceSize int, opts ...AuthO
 	}
 
 	closer := func() error {
-		_, err := (&FlushContext{FlushHandle: sess.handle}).Execute(t)
-		return err
+		return sess.handle.close(t)
 	}
 
 	return &sess, closer, nil
@@ -397,9 +394,14 @@ func getEncryptedSalt(pub TPMTPublic) (*TPM2BEncryptedSecret, []byte, error) {
 
 // Init initializes the session, just in time, if needed.
 func (s *hmacSession) Init(t transport.TPM) error {
-	if s.handle != TPMRHNull {
-		// Session is already initialized.
-		return nil
+	if err := s.handle.closedError(); err != nil {
+		return err
+	}
+	if s.handle.started() {
+		// Session is already initialized. Make sure its handle has not been
+		// flushed or released behind our back.
+		_, err := s.handle.current()
+		return err
 	}
 
 	// Get a high-quality nonceCaller for our use.
@@ -434,7 +436,7 @@ func (s *hmacSession) Init(t transport.TPM) error {
 	if err != nil {
 		return err
 	}
-	s.handle = TPMHandle(sasRsp.SessionHandle.HandleValue())
+	s.handle.bind(TPMHandle(sasRsp.SessionHandle.HandleValue()), t)
 	s.nonceTPM = sasRsp.NonceTPM
 	// Part 1, 19.6
 	ha, err := s.hash.Hash()
@@ -456,12 +458,7 @@ func (s *hmacSession) CleanupFailure(t transport.TPM) error {
 	if s.attrs.ContinueSession {
 		return nil
 	}
-	fc := FlushContext{FlushHandle: s.handle}
-	if _, err := fc.Execute(t); err != nil {
-		return err
-	}
-	s.handle = TPMRHNull
-	return nil
+	return s.handle.cleanup(t)
 }
 
 // NonceTPM returns the last nonceTPM value from the session.
@@ -536,7 +533,11 @@ func (s *hmacSession) NewNonceCaller() error {
 // Authorize computes the authorization structure for the session.
 // Unlike the TPM spec, authIndex is zero-based.
 func (s *hmacSession) Authorize(cc TPMCC, parms, addNonces []byte, names []TPM2BName, authIndex int) (*TPMSAuthCommand, error) {
-	if s.handle == TPMRHNull {
+	handle, err := s.handle.current()
+	if err != nil {
+		return nil, err
+	}
+	if handle == TPMRHNull {
 		// Session is not initialized.
 		return nil, fmt.Errorf("session not initialized")
 	}
@@ -560,7 +561,7 @@ func (s *hmacSession) Authorize(cc TPMCC, parms, addNonces []byte, names []TPM2B
 		return nil, err
 	}
 	result := TPMSAuthCommand{
-		Handle:     s.handle,
+		Handle:     handle,
 		Nonce:      s.nonceCaller,
 		Attributes: s.attrs,
 		Authorization: TPM2BData{
@@ -582,7 +583,7 @@ func (s *hmacSession) Validate(rc TPMRC, cc TPMCC, parms []byte, names []TPM2BNa
 	s.nonceTPM = auth.Nonce
 	// Track the session being automatically flushed.
 	if !auth.Attributes.ContinueSession {
-		s.handle = TPMRHNull
+		s.handle.discard()
 	}
 
 	// Part 1, 19.6
@@ -612,11 +613,17 @@ func (s *hmacSession) Validate(rc TPMRC, cc TPMCC, parms []byte, names []TPM2BNa
 
 // IsEncryption returns true if this is an encryption session.
 func (s *hmacSession) IsEncryption() bool {
+	if _, err := s.handle.current(); err != nil {
+		return false
+	}
 	return s.attrs.Encrypt
 }
 
 // IsDecryption returns true if this is a decryption session.
 func (s *hmacSession) IsDecryption() bool {
+	if _, err := s.handle.current(); err != nil {
+		return false
+	}
 	return s.attrs.Decrypt
 }
 
@@ -687,7 +694,15 @@ func (s *hmacSession) Decrypt(parameter []byte) error {
 // If the session is created with HMAC (instead of HMACSession) this will be
 // TPM_RH_NULL.
 func (s *hmacSession) Handle() TPMHandle {
-	return s.handle
+	handle, err := s.handle.current()
+	if err != nil {
+		return TPMRHNull
+	}
+	return handle
+}
+
+func (s *hmacSession) invalidateHandle() {
+	s.handle.invalidate()
 }
 
 // PolicyCallback represents an object's policy in the form of a function.
@@ -699,7 +714,7 @@ type policySession struct {
 	sessionOptions
 	hash       TPMIAlgHash
 	nonceSize  int
-	handle     TPMHandle
+	handle     sessionHandle
 	sessionKey []byte
 	// last nonceCaller
 	nonceCaller TPM2BNonce
@@ -719,7 +734,6 @@ func Policy(hash TPMIAlgHash, nonceSize int, callback PolicyCallback, opts ...Au
 		sessionOptions: defaultOptions(),
 		hash:           hash,
 		nonceSize:      nonceSize,
-		handle:         TPMRHNull,
 		callback:       &callback,
 	}
 	for _, opt := range opts {
@@ -738,7 +752,6 @@ func PolicySession(t transport.TPM, hash TPMIAlgHash, nonceSize int, opts ...Aut
 		sessionOptions: defaultOptions(),
 		hash:           hash,
 		nonceSize:      nonceSize,
-		handle:         TPMRHNull,
 	}
 	for _, opt := range opts {
 		opt(&sess.sessionOptions)
@@ -754,8 +767,7 @@ func PolicySession(t transport.TPM, hash TPMIAlgHash, nonceSize int, opts ...Aut
 	}
 
 	closer := func() error {
-		_, err := (&FlushContext{sess.handle}).Execute(t)
-		return err
+		return sess.handle.close(t)
 	}
 
 	return &sess, closer, nil
@@ -763,9 +775,14 @@ func PolicySession(t transport.TPM, hash TPMIAlgHash, nonceSize int, opts ...Aut
 
 // Init initializes the session, just in time, if needed.
 func (s *policySession) Init(t transport.TPM) error {
-	if s.handle != TPMRHNull {
-		// Session is already initialized.
-		return nil
+	if err := s.handle.closedError(); err != nil {
+		return err
+	}
+	if s.handle.started() {
+		// Session is already initialized. Make sure its handle has not been
+		// flushed or released behind our back.
+		_, err := s.handle.current()
+		return err
 	}
 
 	// Get a high-quality nonceCaller for our use.
@@ -805,7 +822,7 @@ func (s *policySession) Init(t transport.TPM) error {
 	if err != nil {
 		return err
 	}
-	s.handle = TPMHandle(sasRsp.SessionHandle.HandleValue())
+	s.handle.bind(TPMHandle(sasRsp.SessionHandle.HandleValue()), t)
 	s.nonceTPM = sasRsp.NonceTPM
 	// Part 1, 19.6
 	if s.bindHandle != TPMRHNull || len(salt) != 0 {
@@ -821,7 +838,11 @@ func (s *policySession) Init(t transport.TPM) error {
 
 	// Call the callback to execute the policy, if needed
 	if s.callback != nil {
-		if err := (*s.callback)(t, s.handle, s.nonceTPM); err != nil {
+		handle, err := s.handle.current()
+		if err != nil {
+			return err
+		}
+		if err := (*s.callback)(t, handle, s.nonceTPM); err != nil {
 			return fmt.Errorf("executing policy: %w", err)
 		}
 	}
@@ -835,12 +856,7 @@ func (s *policySession) CleanupFailure(t transport.TPM) error {
 	if s.attrs.ContinueSession {
 		return nil
 	}
-	fc := FlushContext{FlushHandle: s.handle}
-	if _, err := fc.Execute(t); err != nil {
-		return err
-	}
-	s.handle = TPMRHNull
-	return nil
+	return s.handle.cleanup(t)
 }
 
 // NonceTPM returns the last nonceTPM value from the session.
@@ -855,7 +871,11 @@ func (s *policySession) NewNonceCaller() error {
 
 // Authorize computes the authorization structure for the session.
 func (s *policySession) Authorize(cc TPMCC, parms, addNonces []byte, names []TPM2BName, _ int) (*TPMSAuthCommand, error) {
-	if s.handle == TPMRHNull {
+	handle, err := s.handle.current()
+	if err != nil {
+		return nil, err
+	}
+	if handle == TPMRHNull {
 		// Session is not initialized.
 		return nil, fmt.Errorf("session not initialized")
 	}
@@ -882,7 +902,7 @@ func (s *policySession) Authorize(cc TPMCC, parms, addNonces []byte, names []TPM
 	}
 
 	result := TPMSAuthCommand{
-		Handle:     s.handle,
+		Handle:     handle,
 		Nonce:      s.nonceCaller,
 		Attributes: s.attrs,
 		Authorization: TPM2BData{
@@ -909,7 +929,7 @@ func (s *policySession) Validate(rc TPMRC, cc TPMCC, parms []byte, _ []TPM2BName
 	s.nonceTPM = auth.Nonce
 	// Track the session being automatically flushed.
 	if !auth.Attributes.ContinueSession {
-		s.handle = TPMRHNull
+		s.handle.discard()
 	}
 
 	if s.password {
@@ -945,11 +965,17 @@ func (s *policySession) Validate(rc TPMRC, cc TPMCC, parms []byte, _ []TPM2BName
 
 // IsEncryption returns true if this is an encryption session.
 func (s *policySession) IsEncryption() bool {
+	if _, err := s.handle.current(); err != nil {
+		return false
+	}
 	return s.attrs.Encrypt
 }
 
 // IsDecryption returns true if this is a decryption session.
 func (s *policySession) IsDecryption() bool {
+	if _, err := s.handle.current(); err != nil {
+		return false
+	}
 	return s.attrs.Decrypt
 }
 
@@ -1020,5 +1046,13 @@ func (s *policySession) Decrypt(parameter []byte) error {
 // If the session is created with Policy (instead of PolicySession) this will be
 // TPM_RH_NULL.
 func (s *policySession) Handle() TPMHandle {
-	return s.handle
+	handle, err := s.handle.current()
+	if err != nil {
+		return TPMRHNull
+	}
+	return handle
+}
+
+func (s *policySession) invalidateHandle() {
+	s.handle.invalidate()
 }

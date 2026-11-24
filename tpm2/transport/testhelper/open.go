@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/google/go-tpm/tpm2"
+	"github.com/google/go-tpm/tpm2/internal/handles"
 	"github.com/google/go-tpm/tpm2/transport"
 	"github.com/google/go-tpm/tpm2/transport/simulator"
 	"github.com/google/go-tpm/tpm2/transport/tcp"
@@ -89,6 +90,7 @@ func (p *process) Send(cmd []byte) ([]byte, error) {
 
 // Close implements the TPMCloser interface.
 func (p *process) Close() error {
+	defer handles.InvalidateAll(p)
 	var err error
 	var stopped bool
 	if p.conn != nil {

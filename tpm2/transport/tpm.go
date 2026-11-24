@@ -4,6 +4,7 @@ package transport
 import (
 	"io"
 
+	"github.com/google/go-tpm/tpm2/internal/handles"
 	"github.com/google/go-tpm/tpmutil"
 )
 
@@ -86,5 +87,7 @@ func (t *wrappedRWC) Send(input []byte) ([]byte, error) {
 
 // Close implements the TPM interface.
 func (t *wrappedRWC) Close() error {
-	return t.transport.Close()
+	err := t.transport.Close()
+	handles.InvalidateAll(t)
+	return err
 }

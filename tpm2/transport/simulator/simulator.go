@@ -5,6 +5,7 @@ import (
 	"io"
 
 	"github.com/google/go-tpm-tools/simulator"
+	"github.com/google/go-tpm/tpm2/internal/handles"
 	"github.com/google/go-tpm/tpm2/transport"
 	"github.com/google/go-tpm/tpmutil"
 )
@@ -32,5 +33,7 @@ func OpenSimulator() (transport.TPMCloser, error) {
 
 // Close implements the TPM interface.
 func (t *TPM) Close() error {
-	return t.transport.Close()
+	err := t.transport.Close()
+	handles.InvalidateAll(t)
+	return err
 }

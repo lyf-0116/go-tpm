@@ -78,6 +78,7 @@ func execute[R any](t transport.TPM, cmd Command[R, *R], rsp *R, extraSess ...Se
 	rspBuf := bytes.NewBuffer(response)
 	err = rspHeader(rspBuf)
 	if err != nil {
+		err = noteSessionError(err, sess)
 		var bonusErrs []string
 		// Emergency cleanup, then return.
 		for _, s := range sess {

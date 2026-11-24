@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/google/go-tpm/tpm2/internal/handles"
 	"github.com/google/go-tpm/tpm2/transport"
 )
 
@@ -31,7 +32,9 @@ func (t *titanTPM) Send(input []byte) ([]byte, error) {
 
 // Close closes the connection to the TPM.
 func (t *titanTPM) Close() error {
-	return t.cd.close()
+	err := t.cd.close()
+	handles.InvalidateAll(t)
+	return err
 }
 
 // Open creates a TPM connection to a Titan device via IPMI.
